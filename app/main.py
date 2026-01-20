@@ -11,6 +11,7 @@ Authentication Model:
 Run with:
     uvicorn app.main:app --host 0.0.0.0 --port 8000
 """
+import sys
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -26,25 +27,43 @@ logger = get_logger(__name__, settings.log_level)
 async def lifespan(app: FastAPI):
     """
     Application lifespan context manager.
-    Validates configuration on startup.
+    Validates configuration on startup and initializes services.
     """
     # Startup
     try:
-        logger.info("Starting EKS API application")
+        logger.info("=" * 80)
+        logger.info("EKS Kubernetes Operations API - Startup")
+        logger.info("=" * 80)
+        
+        logger.info(f"Python version: {sys.version.split()[0]}")
+        logger.info(f"Application version: 1.0.0")
+        
+        logger.info("Validating configuration...")
         validate_settings()
-        logger.info(
-            f"Configuration: cluster={settings.eks_cluster_name}, "
-            f"region={settings.eks_region}"
-        )
+        
+        logger.info(f"Configuration loaded successfully:")
+        logger.info(f"  - EKS Cluster: {settings.eks_cluster_name}")
+        logger.info(f"  - AWS Region: {settings.eks_region}")
+        logger.info(f"  - Log Level: {settings.log_level}")
+        
+        logger.info("Starting FastAPI application...")
         logger.info("Application startup completed successfully")
-    except ValueError as e:
-        logger.error(f"Configuration validation failed: {str(e)}")
+        logger.info("Ready to accept requests")
+        logger.info("=" * 80)
+        
+    except Exception as e:
+        logger.error("=" * 80)
+        logger.error(f"Configuration validation failed: {str(e)}", exc_info=True)
+        logger.error("=" * 80)
         raise
     
     yield
     
     # Shutdown
-    logger.info("Shutting down EKS API application")
+    logger.info("=" * 80)
+    logger.info("EKS Kubernetes Operations API - Shutdown")
+    logger.info("Gracefully shutting down application...")
+    logger.info("=" * 80)
 
 
 # Create FastAPI application

@@ -67,6 +67,7 @@ cd kubernete-python-app
 ### 2. Create Virtual Environment
 
 ```bash
+sudo apt install python3.12-venv
 python -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 ```
@@ -120,6 +121,15 @@ Using Gunicorn with Uvicorn workers:
 ```bash
 pip install gunicorn
 gunicorn app.main:app -w 4 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000
+```
+
+### Stop application
+
+Using Gunicorn with Uvicorn workers:
+
+```bash
+ps aux | grep uvicorn
+sudo kill -9 <pid>
 ```
 
 ## API Documentation
