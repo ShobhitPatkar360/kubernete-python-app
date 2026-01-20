@@ -46,15 +46,133 @@ class EKSOperationsService:
         self._token = None
         self._configure_clients()
     
+    def _debug_aws_credentials(self) -> Dict[str, Any]:
+        """
+        Debug AWS credential resolution and current caller identity.
+        
+        Boto3 credential resolution order (first match wins):
+        1. Explicit credentials passed to client (not used here)
+        2. Environment variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN
+        3. Shared credential file: ~/.aws/credentials
+        4. Shared config file: ~/.aws/config
+        5. EC2 instance metadata (IAM role) ← PRIMARY for EC2 instances
+        6. Container credentials (if running in ECS)
+        7. CodeBuild credentials
+        
+        Returns:
+            Dict with debugging information
+        
+        Raises:
+            Exception: If no credentials can be resolved
+        """
+        import os
+        from pathlib import Path
+        
+        debug_info = {
+            'region': settings.eks_region,
+            'env_vars': {},
+            'files': {},
+            'credential_source': None,
+            'aws_identity': None
+        }
+        
+        try:
+            # Check environment variables
+            logger.debug("=" * 80)
+            logger.debug("AWS Credential Resolution Debug")
+            logger.debug("=" * 80)
+            
+            env_cred_vars = ['AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN', 'AWS_PROFILE']
+            for var in env_cred_vars:
+                value = os.environ.get(var)
+                if value:
+                    # Mask sensitive values in logs
+                    masked = value[:8] + '*' * (len(value) - 8) if len(value) > 8 else '***'
+                    logger.debug(f"Env var {var}: {masked}")
+                    debug_info['env_vars'][var] = True
+                else:
+                    logger.debug(f"Env var {var}: not set")
+                    debug_info['env_vars'][var] = False
+            
+            # Check credential files
+            cred_file = Path.home() / '.aws' / 'credentials'
+            config_file = Path.home() / '.aws' / 'config'
+            
+            logger.debug(f"AWS credentials file ({cred_file}): {'EXISTS' if cred_file.exists() else 'NOT FOUND'}")
+            debug_info['files']['credentials'] = cred_file.exists()
+            
+            logger.debug(f"AWS config file ({config_file}): {'EXISTS' if config_file.exists() else 'NOT FOUND'}")
+            debug_info['files']['config'] = config_file.exists()
+            
+            # Get current AWS identity to verify credentials work
+            logger.debug("Attempting to get AWS caller identity to verify credentials...")
+            sts_client = boto3.client('sts', region_name=settings.eks_region)
+            identity = sts_client.get_caller_identity()
+            
+            logger.info("✓ AWS Caller Identity:")
+            logger.info(f"  - Account: {identity['Account']}")
+            logger.info(f"  - ARN: {identity['Arn']}")
+            logger.info(f"  - UserId: {identity['UserId']}")
+            
+            debug_info['aws_identity'] = {
+                'Account': identity['Account'],
+                'ARN': identity['Arn'],
+                'UserId': identity['UserId']
+            }
+            
+            # Determine credential source based on identity
+            arn = identity['Arn']
+            if ':role/aws:ec2:' in arn or ':assumed-role/' in arn:
+                debug_info['credential_source'] = 'EC2_INSTANCE_ROLE'
+                logger.info(f"  - Credential Source: EC2 Instance Role (GOOD for EC2)")
+            elif 'AIDAI' in identity['UserId'] or 'AIDA' in identity['UserId']:
+                debug_info['credential_source'] = 'IAM_USER'
+                logger.warning(f"  - Credential Source: IAM User (NOT RECOMMENDED for EC2)")
+            else:
+                debug_info['credential_source'] = 'UNKNOWN'
+                logger.warning(f"  - Credential Source: Unknown (Check manually)")
+            
+            logger.debug("=" * 80)
+            return debug_info
+        
+        except Exception as e:
+            logger.error("=" * 80)
+            logger.error("✗ Failed to get AWS caller identity")
+            logger.error("=" * 80)
+            logger.error(f"Error: {str(e)}", exc_info=True)
+            logger.error("Troubleshooting:")
+            logger.error("  1. If on EC2: Verify IAM role is attached:")
+            logger.error("     curl http://169.254.169.254/latest/meta-data/iam/security-credentials/")
+            logger.error("  2. Check env vars: env | grep AWS_")
+            logger.error("  3. Check ~/.aws files: ls -la ~/.aws/")
+            logger.error("  4. Verify credentials are not expired")
+            logger.error("  5. Check region is correct: {settings.eks_region}")
+            logger.error("=" * 80)
+            raise
+    
     def _get_aws_client(self):
         """
         Get boto3 EKS client.
-        AWS credentials are resolved automatically from:
-        - EC2 IAM role
-        - Environment variables
-        - AWS CLI config
+        
+        AWS credentials are resolved automatically from (first match wins):
+        1. Environment variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+        2. Shared credential file: ~/.aws/credentials
+        3. Shared config file: ~/.aws/config
+        4. EC2 instance metadata (IAM role) ← RECOMMENDED
+        5. Container credentials (ECS/EKS)
+        
+        Raises:
+            botocore.exceptions.NoCredentialsError: If no credentials found
+            botocore.exceptions.ClientError: If credentials invalid
         """
-        return boto3.client('eks', region_name=settings.eks_region)
+        logger.debug(f"Creating boto3 EKS client for region: {settings.eks_region}")
+        
+        # Create client without explicit credentials (use credential chain)
+        # This allows boto3 to automatically discover EC2 instance role credentials
+        client = boto3.client('eks', region_name=settings.eks_region)
+        
+        logger.debug("boto3 EKS client created (will use credential chain for auth)")
+        return client
     
     def _fetch_cluster_info(self) -> Tuple[str, str]:
         """
@@ -64,14 +182,28 @@ class EKSOperationsService:
         - Kubernetes API server endpoint
         - Base64-encoded CA certificate
         
+        **COMMON FAILURES:**
+        - botocore.exceptions.ClientError: UnrecognizedClientException
+          → Invalid AWS credentials, expired token, or wrong region
+        - botocore.exceptions.ClientError: ResourceNotFoundException
+          → Cluster doesn't exist in this region
+        - botocore.exceptions.NoCredentialsError
+          → No AWS credentials found (EC2 role not attached?)
+        - botocore.exceptions.PartialCredentialsError
+          → Environment variables set but incomplete
+        
         Returns:
             Tuple of (cluster_endpoint, ca_cert_data)
         
         Raises:
-            Exception: If cluster not found or API call fails
+            botocore.exceptions.ClientError: If cluster not found or auth fails
+            Exception: If API call fails for other reason
         """
         try:
-            logger.info(f"Fetching cluster info for {settings.eks_cluster_name}")
+            logger.info(f"Fetching cluster info from EKS")
+            logger.debug(f"  - Cluster name: {settings.eks_cluster_name}")
+            logger.debug(f"  - Region: {settings.eks_region}")
+            
             response = self.eks_client.describe_cluster(
                 name=settings.eks_cluster_name
             )
@@ -80,10 +212,58 @@ class EKSOperationsService:
             endpoint = cluster['endpoint']
             ca_data = cluster['certificateAuthority']['data']
             
-            logger.info(f"Successfully fetched cluster endpoint: {endpoint}")
+            logger.info(f"✓ Successfully fetched cluster endpoint: {endpoint}")
+            logger.debug(f"  - CA certificate data length: {len(ca_data)} chars")
+            
             return endpoint, ca_data
+        
         except Exception as e:
-            logger.error(f"Failed to fetch cluster info: {str(e)}")
+            logger.error("=" * 80)
+            logger.error("✗ Failed to fetch cluster info from EKS")
+            logger.error("=" * 80)
+            logger.error(f"Error: {str(e)}")
+            logger.error(f"Error type: {type(e).__name__}")
+            
+            # Provide specific troubleshooting for common errors
+            error_str = str(e).lower()
+            
+            if 'unrecognizedclient' in error_str or 'invalid' in error_str or 'token' in error_str:
+                logger.error("CAUSE: Invalid AWS credentials or expired token")
+                logger.error("FIX:")
+                logger.error("  1. On EC2: Check IAM role is attached:")
+                logger.error("     curl http://169.254.169.254/latest/meta-data/iam/security-credentials/")
+                logger.error("  2. Check AWS credentials are not expired")
+                logger.error("  3. Verify IAM role has EKS permissions:")
+                logger.error("     - eks:DescribeCluster")
+                logger.error("     - eks:ListClusters")
+                logger.error("  4. Verify region matches cluster location: {settings.eks_region}")
+                logger.error("  5. Clear cached credentials: rm ~/.aws/credentials")
+                logger.error("  6. Restart app to refresh EC2 instance metadata")
+            
+            elif 'resourcenotfound' in error_str or 'not found' in error_str:
+                logger.error("CAUSE: EKS cluster not found in this region")
+                logger.error("FIX:")
+                logger.error(f"  1. Verify cluster exists: aws eks describe-cluster --name {settings.eks_cluster_name} --region {settings.eks_region}")
+                logger.error(f"  2. Verify cluster name: {settings.eks_cluster_name}")
+                logger.error(f"  3. Verify region: {settings.eks_region}")
+                logger.error(f"  4. List available clusters: aws eks list-clusters --region {settings.eks_region}")
+            
+            elif 'nocredentials' in error_str or 'unable to locate credentials' in error_str:
+                logger.error("CAUSE: No AWS credentials found")
+                logger.error("FIX:")
+                logger.error("  1. On EC2: Attach IAM role to instance")
+                logger.error("  2. Or set environment variables: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY")
+                logger.error("  3. Or configure ~/.aws/credentials file")
+                logger.error("  4. Verify credential order: env vars → files → EC2 role")
+            
+            else:
+                logger.error("CAUSE: Unknown error (see details above)")
+                logger.error("FIX:")
+                logger.error("  1. Check AWS credentials: aws sts get-caller-identity")
+                logger.error("  2. Verify cluster: aws eks describe-cluster --name ... --region ...")
+                logger.error("  3. Check IAM permissions for EKS")
+            
+            logger.error("=" * 80)
             raise
     
     def _generate_token(self) -> str:
@@ -188,11 +368,12 @@ class EKSOperationsService:
         **No kubeconfig files** - IAM-only authentication.
         
         Process:
-        1. Initialize AWS EKS client
-        2. Fetch cluster endpoint and CA certificate
-        3. Generate short-lived IAM bearer token (extracts from ExecCredential dict)
-        4. Configure kubernetes.client.Configuration manually
-        5. Create Kubernetes API clients (BatchV1Api, CoreV1Api)
+        1. Debug AWS credential resolution and verify caller identity
+        2. Initialize AWS EKS client
+        3. Fetch cluster endpoint and CA certificate
+        4. Generate short-lived IAM bearer token (extracts from ExecCredential dict)
+        5. Configure kubernetes.client.Configuration manually
+        6. Create Kubernetes API clients (BatchV1Api, CoreV1Api)
         """
         try:
             logger.info("=" * 80)
@@ -200,28 +381,33 @@ class EKSOperationsService:
             logger.info("=" * 80)
             logger.debug(f"Cluster: {settings.eks_cluster_name}, Region: {settings.eks_region}")
             
+            # STEP 0: Debug AWS credentials before attempting API calls
+            logger.info("Step 0/5: Debugging AWS credential resolution")
+            debug_info = self._debug_aws_credentials()
+            logger.debug(f"Credential source: {debug_info.get('credential_source', 'UNKNOWN')}")
+            
             # Validate state before starting
             if self.k8s_batch_api is not None or self.k8s_core_api is not None:
                 logger.warning("Kubernetes clients already initialized, reinitializing...")
             
             # STEP 1: Initialize AWS EKS client
-            logger.debug(f"Creating boto3 EKS client for region={settings.eks_region}")
+            logger.info("Step 1/5: Creating boto3 EKS client")
             self.eks_client = self._get_aws_client()
             logger.debug("✓ boto3 EKS client created")
             
             # STEP 2: Fetch cluster endpoint and CA certificate
-            logger.info("Step 1/5: Fetching cluster endpoint and CA certificate from AWS EKS")
+            logger.info("Step 2/5: Fetching cluster endpoint and CA certificate from AWS EKS")
             self._cluster_endpoint, self._ca_cert_data = self._fetch_cluster_info()
             logger.debug(f"✓ Cluster endpoint: {self._cluster_endpoint}")
             logger.debug(f"✓ CA certificate data received (base64, {len(self._ca_cert_data)} chars)")
             
             # STEP 3: Generate IAM bearer token (handles ExecCredential dict extraction)
-            logger.info("Step 2/5: Generating IAM bearer token via eks-token")
+            logger.info("Step 3/5: Generating IAM bearer token via eks-token")
             self._token = self._generate_token()  # Returns extracted token string
             logger.debug(f"✓ Token extracted from ExecCredential response ({len(self._token)} chars)")
             
             # STEP 4: Decode CA certificate from base64
-            logger.info("Step 3/5: Decoding CA certificate from base64")
+            logger.info("Step 4/5: Decoding CA certificate from base64")
             try:
                 ca_cert = base64.b64decode(self._ca_cert_data).decode('utf-8')
                 logger.debug(f"✓ CA certificate decoded ({len(ca_cert)} chars)")
@@ -248,7 +434,7 @@ class EKSOperationsService:
                 raise ValueError(f"Cannot create CA certificate file: {str(e)}")
             
             # STEP 6: Configure Kubernetes client with IAM authentication
-            logger.info("Step 4/5: Configuring Kubernetes client with IAM bearer token")
+            logger.info("Step 5/5: Configuring Kubernetes client with IAM bearer token")
             try:
                 k8s_config = client.Configuration()
                 k8s_config.host = self._cluster_endpoint
@@ -263,7 +449,7 @@ class EKSOperationsService:
                 raise ValueError(f"Kubernetes config error: {str(e)}")
             
             # STEP 7: Create Kubernetes API clients
-            logger.info("Step 5/5: Creating Kubernetes API client instances")
+            logger.info("Step 6/6: Creating Kubernetes API client instances")
             try:
                 api_client = client.ApiClient(k8s_config)
                 self.k8s_batch_api = client.BatchV1Api(api_client)
